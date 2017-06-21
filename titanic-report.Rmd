@@ -1,0 +1,206 @@
+---
+title: "Titanic Survival Rate (Kaggle)"
+author: "Keh-Harng Feng"
+date: "June 21, 2017"
+header-includes:
+    - \usepackage{placeins}
+output: 
+  bookdown::html_document2:
+    fig_caption: TRUE
+    toc: FALSE
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+library('knitr')
+library('lattice')
+library('caret')
+library('missForest')
+library('parallel')
+library('doParallel')
+
+
+opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, tidy = TRUE, cache = TRUE)
+options(digits = 4)
+
+## functions
+
+# Data PreProcessing
+# Function that checks if the measurement has no missing values for useful features.
+
+chk_missing <- function(datapoint, useful) {
+    useful_vars <- names(datapoint)[names(datapoint) %in% useful]
+    
+    return(sum(is.na(datapoint[useful_vars])) > 0)
+}
+
+
+# Remove data with missing values and return preprocessed data, chosen indices 
+# and original data.
+my_preProcess <- function(data, useful) {
+    n <- nrow(data)
+    
+    good_ind <- rep(FALSE, n)
+    
+    for (i in 1:n) {
+        good_ind[i] = !chk_missing(data[i,], useful)
+    }
+    
+    ans = list(data = data[good_ind,], ind = good_ind, original = data)
+    
+    return(ans)
+}
+
+
+# Data imputation
+my_impute <- function(data, useful) {
+    imputed_vars <- missForest(data[,names(data) %in% useful], ntree = 5001, 
+                               variablewise = FALSE)
+    
+    data[,names(data) %in% useful] <- imputed_vars$ximp
+    
+    ans = list(data.imp = data, obj.imp = imputed_vars)
+    return(ans)
+}
+
+my_predict <- function(train.model, data, useful) {
+    # Preprocess testing set.
+    data.preProc <- my_preProcess(data, useful)
+    
+    pred <- rep(NA, nrow(data))
+    
+    pred[data.preProc$ind] <- as.numeric(as.character(predict(train.model, 
+                                                              data.preProc$data)))
+    pred <- factor(pred)
+    
+    return(pred)
+}
+```
+
+# Data Ingress & Preprocesss
+The Titanic survival data is stored in csv format and imported into R using `read.csv()`. The first couple rows of the resulting data frame are shown below:
+
+```{r}
+data <- read.csv('train.csv', header = TRUE, na.string = '')
+n <- nrow(data)
+head(data)
+```
+
+The following variables are identified as categorical and converted to factors:
+```{r}
+# Categorical variables: Sex, Survived, Pclass, Embarked
+categorical <- c('Sex', 'Survived', 'Pclass', 'Embarked', 'Name', 'Cabin', 'PassengerId', 'Ticket')
+
+for (var in categorical) {
+    data[,var] <- factor(data[,var])
+}
+
+print(categorical)
+```
+
+Notice that `Survived` is the response, therefore this is a classification problem. There are `r n` observations so the sample is a decent size. The training data is thus further split into a 80% training and 20% validation set for model building.
+
+```{r}
+# 80%, 20% training/testing split
+set.seed(123)
+inTrain <- sample(1:n, size = ceiling(n*0.8))
+
+data.train <- data[inTrain, ]
+data.test <- data[-inTrain, ]
+```
+
+## Feature Selection
+From this point on all operations are carried out on the 80% training set only unless otherwise specified. Feature selection is done mainly by logic. Essentially, predictors that I do not believe to have a logical connection to the survival rate are excluded from the model. These are shown below
+
+```{r}
+# Uselss features: Name, Cabin, PassengerId
+useless <- c('Name', 'Cabin', 'PassengerId', 'Ticket')
+
+cabin_unknown <- sum(is.na(data$Cabin))
+```
+
+It should be noted that `Cabin` as a predictor can potential predict a passenger's location on the ship. Therefore it is possible for it to have a logical connection to survival rate. However, the data as it stands has over `r cabin_unknown` missing entries (out of `r n` total entries) for the `Cabin` predictor. With so many missing entries it is impossible to for it be imputed reliably. `Cabin` is therefore discarded.
+
+For the numerical predictors a check for colinearity is carried out using `caret::findCorrelation()` with the cutoff set at 0.9:
+
+```{r}
+# All potentially useful predictors
+useful <- names(data.train)[!(names(data.train) %in% 
+                                             c(useless, 'Survived'))]
+
+# Useful numerical predictors
+useful.numerical <- useful[!(useful %in% categorical)]
+
+# check if any predictors should be removed due to colinearity
+print(findCorrelation(x = cor(data.train[,useful.numerical]), names = TRUE, 
+                cutoff = 0.9))
+```
+
+There are no colinear predictors. With this in mind the preliminary features selected for model training are:
+
+```{r}
+print(useful)
+```
+
+The reason the port of initial embarkation (`Embarked`) is included is because it may be connected to where the passenger's room was located on the ship.
+
+## Data Imputation
+```{r}
+n_miss <- sum(is.na(data.train$Age))
+```
+The `Age` predictor is the only selected predictor that contains missing data. The percentage of missing data is `r n_miss/nrow(data.train)`. This should allow reliable imputation using random forest (set at 5001 trees to avoid ties). OOB imputation error estimate is shown below:
+
+```{r}
+num_trees <- 5001
+
+set.seed(123)
+imputation <- my_impute(data.train, useful)
+
+print(imputation$obj.imp$OOBerror)
+
+data.train.imp <- imputation$data
+
+age_error <- imputation$obj.imp$OOBerror[1]*mean(data.train.imp$Age)
+```
+
+With a normalized MSE of `r imputation$obj.imp$OOBerror[1]` the estimated OOB error for imputed age is `r age_error`.
+
+# Model Building
+Model is first built using random forest on the training set with the number of features selected at each level (`mtry`) tuned from 1 to all of the useful predictors at once using 10-fold CV.
+
+```{r}
+tunegrid <- expand.grid(mtry = c(1:length(useful)))
+
+trCon <- trainControl(method = 'cv', number = 10, search = 'grid',
+                      allowParallel = TRUE)
+
+# Train Random Forest model
+cl <- makePSOCKcluster(detectCores())
+registerDoParallel(cl)
+
+set.seed(123)
+trCon <- trainControl(method = 'cv', number = 10, search = 'grid', 
+                      allowParallel = TRUE)
+rf_gridsearch.imp <- train(formula, data = data.train.imp, method = 'rf', 
+                       ntree = num_trees, tuneGrid = tunegrid, 
+                       importance = TRUE, na.action = na.fail, trControl = trCon) 
+
+stopCluster(cl)
+```
+
+Figure \@ref(fig:varimp) shows the variable importance from the selected features. It seems that the most important predictor is `Sex` by far - a whopping 300 misclassifications out of `r n` observations if `Sex` is permuted.
+```{r varimp, fig.cap = 'Variable importance for the optimal random forest model on the training set.'}
+varImpPlot(rf_gridsearch.imp$finalModel)
+```
+
+```{r}
+set.seed(123)
+test.imputation <- my_impute(data.test, useful)
+data.test.imp <- test.imputation$data
+
+pred.imp <- predict(rf_gridsearch.imp, data.test.imp)
+
+confusionMatrix(pred.imp, data.test.imp$Survived)
+
+
+```
