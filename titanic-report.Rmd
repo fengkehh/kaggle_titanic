@@ -101,12 +101,12 @@ print(categorical)
 Notice that `Survived` is the response, therefore this is a classification problem. There are `r n` observations so the sample is a decent size. The training data is thus further split into a 80% training and 20% validation set for model building.
 
 ```{r}
-# 80%, 20% training/testing split
+# 80%, 20% training/validation split
 set.seed(123)
 inTrain <- sample(1:n, size = ceiling(n*0.8))
 
 data.train <- data[inTrain, ]
-data.test <- data[-inTrain, ]
+data.validation <- data[-inTrain, ]
 ```
 
 ## Feature Selection
@@ -204,15 +204,15 @@ The final model built from the 80% training set is used to make predictions on t
 
 ```{r}
 set.seed(123)
-test.imputation <- my_impute(data.test, useful)
+validation.imputation <- my_impute(data.validation, useful)
 
-print(test.imputation$obj.imp$OOBerror)
+print(validation.imputation$obj.imp$OOBerror)
 
-data.test.imp <- test.imputation$data
+data.validation.imp <- validation.imputation$data
 
-pred.imp <- predict(rf_gridsearch.imp, data.test.imp)
+pred.imp <- predict(rf_gridsearch.imp, data.validation.imp)
 
-confMat <- confusionMatrix(pred.imp, data.test.imp$Survived)
+confMat <- confusionMatrix(pred.imp, data.validation.imp$Survived)
 
 confMat
 ```
@@ -234,4 +234,25 @@ rf_production.imp <- train(formula, data = data.imp, method = 'rf',
 
 stopCluster(cl)
 ```
-The test set is similarly imputed and 
+The test set is similarly imputed and predicted using the production model.
+
+```{r}
+data.test <- read.csv('test.csv', header = TRUE, na.string = '')
+
+for (var in categorical[-2]) {
+    data.test[,var] <- factor(data.test[,var])
+}
+
+
+test.imputation <- my_impute(data.test, useful)
+```
+
+```{r}
+data.test.imp <- test.imputation$data
+
+test.pred <- predict(rf_production.imp, data.test.imp)
+
+df.out <- data.frame(PassengerId = data.test.imp$PassengerId, Survived = test.pred)
+
+write.csv(df.out, file = 'my_submission.csv', row.names = FALSE, quote = FALSE)
+```
